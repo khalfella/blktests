@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0+
+// Copyright (C) 2026 Mohamed Khalfella
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,22 +11,29 @@
 #include <errno.h>
 
 #define BUF_SIZE	4096
+/*
 #define ITERATIONS	255
+*/
+#define ITERATIONS	0
 #define WRITE_COUNT	10
 
 #define WRITE_OFFSET	0
 #define READ_OFFSET	WRITE_OFFSET
 
-int main() {
+int main(int argc, char **argv)
+{
 	int fd, i, w, off, ret;
 	char *buff;
 
 	/* Just return for now */
-	fprintf(stdout, "starting nvme-ghost-write test program\n");
-	fprintf(stdout, "finished nvme-ghost-write test program\n");
-	return 0;
+	fprintf(stdout, "starting %s test program\n", basename(argv[0]));
 
-	fd = open("/dev/nvme0n1", O_RDWR | O_DIRECT);
+	if (argc < 2) {
+		fprintf(stderr, "usage: %s /dev/nvmeXnY", argv[0]);
+		return EINVAL;
+	}
+
+	fd = open(argv[1], O_RDWR | O_DIRECT);
 	if (fd < 0) {
 		fprintf(stderr, "failed to open device, errno = %d\n", errno);
 		return 1;
@@ -35,7 +45,7 @@ int main() {
 		return 1;
 	}
 
-	for (i = 0; i < 255; i++) {
+	for (i = 0; i < ITERATIONS; i++) {
 		fprintf(stdout, "iteration number %d, writing data\n", i);
 
 		for (w = 0; w < WRITE_COUNT; w++) {
@@ -71,5 +81,6 @@ int main() {
 		sleep(3);
 	}
 
+	fprintf(stdout, "finished %s test program\n", basename(argv[0]));
 	return 0;
 }
