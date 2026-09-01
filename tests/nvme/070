@@ -51,6 +51,7 @@ DESCRIPTION="Tests ghost write on failed nvme path"
 requires() {
 	_nvme_requires
 	_require_nvme_trtype_is_fabrics
+	_have_src_program nvme-ghost-write
 }
 
 # TODO: if this test has extra requirements for what devices it can be run on,
