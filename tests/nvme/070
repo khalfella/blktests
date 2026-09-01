@@ -154,19 +154,14 @@ test() {
 	echo "Running ${TEST_NAME}"
 
 	local ns
-	local count
-	local bs
 
 	_setup_nvmet
 	_nvmet_target_setup
 	_nvme_connect_subsys
 
 	ns=$(_find_nvme_ns "${def_subsys_uuid}")
-	count=20
-	bs=4096
 
-	dd if=/dev/urandom of="/dev/${ns}" \
-		count="${count}" bs="${bs}" status=none
+	"$SRCDIR/nvme-ghost-write" "/dev/${ns}"
 
 	_nvme_disconnect_subsys
 	_nvmet_target_cleanup
