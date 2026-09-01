@@ -14,6 +14,7 @@
 /zbdioctl
 /miniublk
 /nvme-passthrough-meta
+/nvme-ghost-write
 /ioctl-lbmd-query
 /nvme-passthru-admin-uring
 /nvme-delay-ioctl

@@ -50,6 +50,8 @@ DESCRIPTION="Tests ghost write on failed nvme path"
 # If requires() adds strings to $SKIP_REASONS, the test is skipped.
 requires() {
 	_nvme_requires
+	_have_loop
+	_have_module_param_value nvme_core multipath Y
 	_require_nvme_trtype_is_fabrics
 	_have_src_program nvme-ghost-write
 }
@@ -150,17 +152,40 @@ set_conditions() {
 #    - $TEST_DEV_ARRAY_SYSFS -- the sysfs directories of the devices in the
 #                                form of an associative array. Use values in
 #                                TEST_DEV_ARRAY as the keys.
+
+count_paths_to_subsystem() {
+	local subsysnqn="$1"
+	local dev count
+
+	count=0
+	for dev in /sys/class/nvme/nvme*; do
+		[[ -e "${dev}/subsysnqn" ]] || continue
+		[[ "$(cat "${dev}/subsysnqn")" != "${subsysnqn}" ]] || continue
+		count=$(( count + 1 ))
+	done
+	echo "${count}"
+}
+
 test() {
 	echo "Running ${TEST_NAME}"
 
-	local ns
+	local ns port nr_paths
+	local -a ports
 
 	_setup_nvmet
-	_nvmet_target_setup
-	_nvme_connect_subsys
+	_nvmet_target_setup --ports 2
+
+	_get_nvmet_ports "${def_subsysnqn}" ports
+	for port in "${ports[@]}"; do
+		_nvme_connect_subsys --port "${port}"
+	done
+
+	nr_paths=$(count_paths_to_subsystem "${def_subsysnqn}")
+	if ((  nr_paths != 2 )); then
+		echo "FAIL: expected 2 paths, found ${nr_paths}"
+	fi
 
 	ns=$(_find_nvme_ns "${def_subsys_uuid}")
-
 	"$SRCDIR/nvme-ghost-write" "/dev/${ns}"
 
 	_nvme_disconnect_subsys
