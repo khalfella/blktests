@@ -9,12 +9,15 @@
 #include <string.h>
 #include <malloc.h>
 #include <errno.h>
+#include <libgen.h>
 
 #define BUF_SIZE	4096
 /*
 #define ITERATIONS	255
 */
 #define ITERATIONS	0
+
+#define DELAY		3		/* second delay between iterations */
 #define WRITE_COUNT	10
 
 #define WRITE_OFFSET	0
@@ -30,7 +33,7 @@ int main(int argc, char **argv)
 
 	if (argc < 2) {
 		fprintf(stderr, "usage: %s /dev/nvmeXnY", argv[0]);
-		return EINVAL;
+		return 1;
 	}
 
 	fd = open(argv[1], O_RDWR | O_DIRECT);
@@ -42,7 +45,7 @@ int main(int argc, char **argv)
 	ret = posix_memalign((void **)&buff, BUF_SIZE, BUF_SIZE);
 	if (ret) {
 		fprintf(stderr, "failed to allocate buffer, ret = %d\n", ret);
-		return 1;
+		goto out;
 	}
 
 	for (i = 0; i < ITERATIONS; i++) {
@@ -55,7 +58,7 @@ int main(int argc, char **argv)
 				fprintf(stderr, "failed to write buff, "
 						"ret = %d, errno = %d\n",
 						ret, errno);
-				exit(1);
+				goto out;
 			}
 		}
 
@@ -67,7 +70,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "failed to read buff, "
 					"ret = %d, errno = %d\n",
 					ret, errno);
-			exit(1);
+			goto out;
 		}
 
 		for (off = 0; off < BUF_SIZE; off++) {
@@ -78,9 +81,11 @@ int main(int argc, char **argv)
 		}
 
 		fprintf(stdout, "successfully validated\n");
-		sleep(3);
+		sleep(DELAY);
 	}
 
 	fprintf(stdout, "finished %s test program\n", basename(argv[0]));
-	return 0;
+out:
+	close(fd);
+	return ret;
 }
