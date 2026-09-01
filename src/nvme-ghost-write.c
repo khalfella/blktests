@@ -12,12 +12,8 @@
 #include <libgen.h>
 
 #define BUF_SIZE	4096
-/*
-#define ITERATIONS	255
-*/
-#define ITERATIONS	0
-
-#define DELAY		3		/* second delay between iterations */
+#define ITERATIONS	10
+#define DELAY		3		/* seconds delay between iterations */
 #define WRITE_COUNT	10
 
 #define WRITE_OFFSET	0
