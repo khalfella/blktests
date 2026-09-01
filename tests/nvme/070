@@ -160,7 +160,7 @@ count_paths_to_subsystem() {
 	count=0
 	for dev in /sys/class/nvme/nvme*; do
 		[[ -e "${dev}/subsysnqn" ]] || continue
-		[[ "$(cat "${dev}/subsysnqn")" != "${subsysnqn}" ]] || continue
+		[[ "$(cat "${dev}/subsysnqn")" == "${subsysnqn}" ]] || continue
 		count=$(( count + 1 ))
 	done
 	echo "${count}"
@@ -176,6 +176,7 @@ test() {
 	_nvmet_target_setup --ports 2
 
 	_get_nvmet_ports "${def_subsysnqn}" ports
+	echo "Target ports: ${#ports[@]}"
 	for port in "${ports[@]}"; do
 		_nvme_connect_subsys --port "${port}"
 	done
