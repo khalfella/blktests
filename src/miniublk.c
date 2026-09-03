@@ -19,6 +19,7 @@
 #include <limits.h>
 #include <string.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
@@ -49,7 +50,8 @@
 #define UBLK_CTRL_MSG_MAGIC	0x6b6c6275
 
 enum {
-	UBLK_CTRL_CMD_PING	= 0,
+	UBLK_CTRL_CMD_PING		= 0,
+	UBLK_CTRL_CMD_INJECT_DELAY	= 1,
 };
 
 struct ublk_ctrl_msg {
@@ -84,6 +86,8 @@ struct ublk_io {
 	unsigned int flags;
 
 	unsigned int result;
+
+	struct __kernel_timespec delay_ts;
 };
 
 struct ublk_tgt_ops {
@@ -136,6 +140,10 @@ struct ublk_dev {
 	/* daemon control channel, 0 means it is disabled */
 	int ctrl_port;
 	int ctrl_sock;
+
+	atomic_int inject_op;
+	atomic_int inject_secs;
+	atomic_int inject_count;
 };
 
 #ifndef offsetof
@@ -188,6 +196,13 @@ static inline unsigned int user_data_to_tag(__u64 user_data)
 static inline unsigned int user_data_to_op(__u64 user_data)
 {
 	return (user_data >> 16) & 0xff;
+}
+
+#define UBLK_DELAY_MARK		1
+
+static inline unsigned int user_data_to_tgt_data(__u64 user_data)
+{
+	return (user_data >> 24) & 0xff;
 }
 
 static void ublk_err(const char *fmt, ...)
@@ -509,6 +524,7 @@ static struct ublk_dev *ublk_ctrl_init()
 
 	dev->use_ioctl = true; /* use ioctl opcodes by default */
 	dev->ctrl_sock = -1;
+	dev->inject_op = -1;
 
 	dev->ctrl_fd = open(CTRL_DEV, O_RDWR);
 	if (dev->ctrl_fd < 0) {
@@ -637,6 +653,26 @@ static int ublk_ctrl_msg_handle(struct ublk_dev *dev,
 	case UBLK_CTRL_CMD_PING:
 		rsp->data[0] = dev->dev_info.dev_id;
 		return 0;
+	case UBLK_CTRL_CMD_INJECT_DELAY: {
+		int op = req->data[0];
+		int secs = req->data[1];
+		int count = req->data[2];
+
+		if (op != UBLK_IO_OP_READ && op != UBLK_IO_OP_WRITE)
+			return -EINVAL;
+		if (secs <= 0 || count <= 0)
+			return -EINVAL;
+
+		dev->inject_op = op;
+		dev->inject_secs = secs;
+		/* arm the count last, the request becomes visible at once */
+		dev->inject_count = count;
+
+		ublk_log("dev %d: delay next %d %s io(s) by %d secs\n",
+				dev->dev_info.dev_id, count,
+				op == UBLK_IO_OP_READ ? "read" : "write", secs);
+		return 0;
+	}
 	default:
 		ublk_dbg(UBLK_DBG_DEV, "%s: unknown control command %u\n",
 				__func__, req->cmd);
@@ -773,6 +809,66 @@ static void ublk_dev_unprep(struct ublk_dev *dev)
 	close(dev->fds[0]);
 }
 
+static int ublk_inject_claim(struct ublk_queue *q, unsigned int ublk_op)
+{
+	struct ublk_dev *dev = q->dev;
+	int secs;
+
+	if (dev->inject_count <= 0)
+		return 0;
+
+	if (dev->inject_op != (int)ublk_op)
+		return 0;
+
+	secs = dev->inject_secs;
+	if (secs <= 0)
+		return 0;
+
+	if (atomic_fetch_sub(&dev->inject_count, 1) <= 0) {
+		/* another queue took the last one */
+		atomic_fetch_add(&dev->inject_count, 1);
+		return 0;
+	}
+
+	return secs;
+}
+
+static int ublk_delay_io(struct ublk_queue *q, int tag)
+{
+	const struct ublksrv_io_desc *iod = ublk_get_iod(q, tag);
+	unsigned int ublk_op = ublksrv_get_op(iod);
+	struct ublk_io *io = &q->ios[tag];
+	struct io_uring_sqe *sqe;
+	int secs;
+
+	secs = ublk_inject_claim(q, ublk_op);
+	if (!secs)
+		return 0;
+
+	sqe = io_uring_get_sqe(&q->ring);
+	if (!sqe) {
+		ublk_err("%s: run out of sqe %d, tag %d\n", __func__,
+				q->q_id, tag);
+		atomic_fetch_add(&q->dev->inject_count, 1);
+		return 0;
+	}
+
+	io->delay_ts.tv_sec = secs;
+	io->delay_ts.tv_nsec = 0;
+
+	io_uring_prep_timeout(sqe, &io->delay_ts, 0, 0);
+	/* bit63 marks us as tgt io, tgt_data marks us as the delay timeout */
+	sqe->user_data = build_user_data(tag, ublk_op, UBLK_DELAY_MARK, 1);
+
+	q->io_inflight++;
+
+	ublk_dbg(UBLK_DBG_IO, "%s: dev %d q %d tag %d: delay %s io by %d secs\n",
+			__func__, q->dev->dev_info.dev_id, q->q_id, tag,
+			ublk_op == UBLK_IO_OP_READ ? "read" : "write", secs);
+
+	return 1;
+}
+
 static int ublk_queue_io_cmd(struct ublk_queue *q,
 		struct ublk_io *io, unsigned tag)
 {
@@ -896,6 +992,16 @@ static inline void ublksrv_handle_tgt_cqe(struct ublk_queue *q,
 {
 	unsigned tag = user_data_to_tag(cqe->user_data);
 
+	/*
+	 * A delay timeout completes with -ETIME. It is not a real io, so hand
+	 * the tag back to queue_io() instead of completing it.
+	 */
+	if (user_data_to_tgt_data(cqe->user_data) == UBLK_DELAY_MARK) {
+		q->io_inflight--;
+		q->tgt_ops->queue_io(q, tag);
+		return;
+	}
+
 	if (cqe->res < 0 && cqe->res != -EAGAIN)
 		ublk_err("%s: failed tgt io: res %d qid %u tag %u, cmd_op %u\n",
 			__func__, cqe->res, q->q_id,
@@ -937,7 +1043,8 @@ static void ublk_handle_cqe(struct io_uring *r,
 
 	if (cqe->res == UBLK_IO_RES_OK) {
 		ublk_assert(tag < q->q_depth);
-		q->tgt_ops->queue_io(q, tag);
+		if (!ublk_delay_io(q, tag))
+			q->tgt_ops->queue_io(q, tag);
 	} else {
 		/*
 		 * COMMIT_REQ will be completed immediately since no fetching
