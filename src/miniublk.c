@@ -48,6 +48,7 @@
 
 #define UBLK_CTRL_PORT_BASE	61000
 #define UBLK_CTRL_MSG_MAGIC	0x6b6c6275
+#define UBLK_CTRL_RCV_TIMEO	3
 
 enum {
 	UBLK_CTRL_CMD_PING		= 0,
@@ -1561,6 +1562,114 @@ static int cmd_dev_list(int argc, char *argv[])
 	return 0;
 }
 
+static int cmd_dev_inject(int argc, char *argv[])
+{
+	static const struct option longopts[] = {
+		{ "number",		1,	NULL, 'n' },
+		{ "op",			1,	NULL, 'o' },
+		{ "delay",		1,	NULL, 'd' },
+		{ "count",		1,	NULL, 'c' },
+		{ "control_port",	1,	NULL, 0},
+		{ NULL }
+	};
+	struct timeval tv = { .tv_sec = UBLK_CTRL_RCV_TIMEO, };
+	struct ublk_ctrl_msg req = {};
+	struct ublk_ctrl_msg rsp;
+	struct sockaddr_in addr;
+	int dev_id = -1, op = -1, delay = 0, count = 1;
+	int ctrl_port = -1;
+	int fd, ret, option_idx, opt;
+
+	while ((opt = getopt_long(argc, argv, "n:o:d:c:",
+				  longopts, &option_idx)) != -1) {
+		switch (opt) {
+		case 'n':
+			dev_id = strtol(optarg, NULL, 10);
+			break;
+		case 'o':
+			if (!strcmp(optarg, "read"))
+				op = UBLK_IO_OP_READ;
+			else if (!strcmp(optarg, "write"))
+				op = UBLK_IO_OP_WRITE;
+			break;
+		case 'd':
+			delay = strtol(optarg, NULL, 10);
+			break;
+		case 'c':
+			count = strtol(optarg, NULL, 10);
+			break;
+		case 0:
+			if (!strcmp(longopts[option_idx].name, "control_port"))
+				ctrl_port = strtol(optarg, NULL, 10);
+			break;
+		}
+	}
+
+	if (dev_id < 0 || op < 0 || delay <= 0 || count <= 0) {
+		ublk_err("%s: -n dev_id -o {read|write} -d delay -c count are required\n",
+				__func__);
+		return -EINVAL;
+	}
+
+	if (ctrl_port < 0)
+		ctrl_port = UBLK_CTRL_PORT_BASE + dev_id;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		ublk_err("%s: can't create socket: %s\n", __func__,
+				strerror(errno));
+		return -errno;
+	}
+	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(ctrl_port);
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	/* connect so that a missing daemon shows up as ECONNREFUSED */
+	if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		ublk_err("%s: can't connect to port %d: %s\n", __func__,
+				ctrl_port, strerror(errno));
+		ret = -errno;
+		goto out;
+	}
+
+	req.magic = UBLK_CTRL_MSG_MAGIC;
+	req.cmd = UBLK_CTRL_CMD_INJECT_DELAY;
+	req.data[0] = op;
+	req.data[1] = delay;
+	req.data[2] = count;
+
+	if (send(fd, &req, sizeof(req), 0) != sizeof(req)) {
+		ublk_err("%s: can't send to port %d: %s\n", __func__,
+				ctrl_port, strerror(errno));
+		ret = -errno;
+		goto out;
+	}
+
+	if (recv(fd, &rsp, sizeof(rsp), 0) != sizeof(rsp)) {
+		ublk_err("%s: no reply from dev %d on port %d: %s\n", __func__,
+				dev_id, ctrl_port, strerror(errno));
+		ret = -errno;
+		goto out;
+	}
+
+	if (rsp.magic != UBLK_CTRL_MSG_MAGIC) {
+		ublk_err("%s: bad reply from port %d\n", __func__, ctrl_port);
+		ret = -EPROTO;
+		goto out;
+	}
+
+	ret = rsp.ret;
+	if (ret)
+		ublk_err("%s: dev %d rejected the request: %d\n", __func__,
+				dev_id, ret);
+out:
+	close(fd);
+	return ret;
+}
+
 static int cmd_dev_help(int argc, char *argv[])
 {
 	printf("%s add -t {null|loop} [-q nr_queues] [-d depth] [-n dev_id] [--control_port port] \n",
@@ -1577,6 +1686,9 @@ static int cmd_dev_help(int argc, char *argv[])
 	printf("%s recover -t {null|loop} [-n dev_id] [--control_port port] \n", argv[0]);
 	printf("\t -t loop -f backing_file \n");
 	printf("\t -t null\n");
+	printf("%s inject -n dev_id -o {read|write} -d delay -c count [--control_port port] \n",
+			argv[0]);
+	printf("\t delay the next <count> <read|write> ios by <delay> seconds\n");
 	return 0;
 }
 
@@ -1915,6 +2027,8 @@ int main(int argc, char *argv[])
 		ret = cmd_dev_help(argc, argv);
 	else if (!strcmp(cmd, "recover"))
 		ret = cmd_dev_recover(argc, argv);
+	else if (!strcmp(cmd, "inject"))
+		ret = cmd_dev_inject(argc, argv);
 out:
 	if (ret)
 		cmd_dev_help(argc, argv);
