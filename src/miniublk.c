@@ -22,6 +22,8 @@
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <liburing.h>
 #include <linux/ublk_cmd.h>
 
@@ -42,6 +44,22 @@
 #define UBLK_DBG_IO             (1U << 3)
 #define UBLK_DBG_CTRL_CMD       (1U << 4)
 #define UBLK_LOG		(1U << 5)
+
+#define UBLK_CTRL_PORT_BASE	61000
+#define UBLK_CTRL_MSG_MAGIC	0x6b6c6275
+
+enum {
+	UBLK_CTRL_CMD_PING	= 0,
+};
+
+struct ublk_ctrl_msg {
+	__u32	magic;
+	union {
+		__u32	cmd;
+		__s32	ret;
+	};
+	__u64	data[3];
+};
 
 struct ublk_dev;
 struct ublk_queue;
@@ -114,6 +132,10 @@ struct ublk_dev {
 	int ctrl_fd;
 	bool use_ioctl;
 	struct io_uring ring;
+
+	/* daemon control channel, 0 means it is disabled */
+	int ctrl_port;
+	int ctrl_sock;
 };
 
 #ifndef offsetof
@@ -486,6 +508,7 @@ static struct ublk_dev *ublk_ctrl_init()
 	int ret;
 
 	dev->use_ioctl = true; /* use ioctl opcodes by default */
+	dev->ctrl_sock = -1;
 
 	dev->ctrl_fd = open(CTRL_DEV, O_RDWR);
 	if (dev->ctrl_fd < 0) {
@@ -607,6 +630,109 @@ static int ublk_queue_init(struct ublk_queue *q)
 	return -ENOMEM;
 }
 
+static int ublk_ctrl_msg_handle(struct ublk_dev *dev,
+		const struct ublk_ctrl_msg *req, struct ublk_ctrl_msg *rsp)
+{
+	switch (req->cmd) {
+	case UBLK_CTRL_CMD_PING:
+		rsp->data[0] = dev->dev_info.dev_id;
+		return 0;
+	default:
+		ublk_dbg(UBLK_DBG_DEV, "%s: unknown control command %u\n",
+				__func__, req->cmd);
+		return -EINVAL;
+	}
+}
+
+static void *ublk_ctrl_sock_fn(void *data)
+{
+	struct ublk_dev *dev = data;
+	struct sockaddr_in peer;
+	struct ublk_ctrl_msg req;
+	struct ublk_ctrl_msg rsp;
+	socklen_t peer_len;
+	ssize_t len;
+
+	for (;;) {
+		peer_len = sizeof(peer);
+		len = recvfrom(dev->ctrl_sock, &req, sizeof(req), 0,
+				(struct sockaddr *)&peer, &peer_len);
+		if (len < 0) {
+			if (errno == EINTR)
+				continue;
+			ublk_err("dev %d: control socket recv failed: %s\n",
+					dev->dev_info.dev_id, strerror(errno));
+			break;
+		}
+
+		if (len != sizeof(req) || req.magic != UBLK_CTRL_MSG_MAGIC) {
+			ublk_dbg(UBLK_DBG_DEV,
+				"%s: dropped %zd byte datagram\n", __func__,
+				len);
+			continue;
+		}
+
+		memset(&rsp, 0, sizeof(rsp));
+		rsp.magic = UBLK_CTRL_MSG_MAGIC;
+		rsp.ret = ublk_ctrl_msg_handle(dev, &req, &rsp);
+
+		if (sendto(dev->ctrl_sock, &rsp, sizeof(rsp), 0,
+				(struct sockaddr *)&peer, peer_len) < 0)
+			ublk_dbg(UBLK_DBG_DEV, "%s: reply failed: %s\n",
+					__func__, strerror(errno));
+	}
+
+	return NULL;
+}
+
+static void ublk_ctrl_sock_init(struct ublk_dev *dev)
+{
+	struct sockaddr_in addr = {
+		.sin_family = AF_INET,
+		.sin_port = htons(dev->ctrl_port),
+		.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+	};
+	int dev_id = dev->dev_info.dev_id;
+	pthread_t thread;
+	int fd, ret;
+
+	if (!dev->ctrl_port)
+		return;
+
+	fd = socket(AF_INET, SOCK_DGRAM, 0);
+	if (fd < 0) {
+		ublk_err("dev %d: can't create control socket: %s\n",
+				dev_id, strerror(errno));
+		return;
+	}
+
+	if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+		ublk_err("dev %d: can't bind control port %d: %s\n",
+				dev_id, dev->ctrl_port, strerror(errno));
+		close(fd);
+		return;
+	}
+
+	dev->ctrl_sock = fd;
+
+	/*
+	 * The listener is detached and never joined. It blocks in recvfrom()
+	 * until the daemon exits, and goes away with the process.
+	 */
+	ret = pthread_create(&thread, NULL, ublk_ctrl_sock_fn, dev);
+	if (ret) {
+		ublk_err("dev %d: can't start control thread: %s\n",
+				dev_id, strerror(ret));
+		close(fd);
+		dev->ctrl_sock = -1;
+		return;
+	}
+	pthread_detach(thread);
+
+	ublk_log("dev %d: control socket listening on 127.0.0.1:%d\n",
+			dev_id, dev->ctrl_port);
+}
+
 static int ublk_dev_prep(struct ublk_dev *dev)
 {
 	int dev_id = dev->dev_info.dev_id;
@@ -620,6 +746,8 @@ static int ublk_dev_prep(struct ublk_dev *dev)
 		ublk_err("can't open %s, ret %d\n", buf, dev->fds[0]);
 		goto fail;
 	}
+
+	ublk_ctrl_sock_init(dev);
 
 	if (dev->dev_info.state != UBLK_S_DEV_QUIESCED && dev->tgt.ops->init_tgt)
 		ret = dev->tgt.ops->init_tgt(dev);
@@ -635,6 +763,11 @@ fail:
 
 static void ublk_dev_unprep(struct ublk_dev *dev)
 {
+	if (dev->ctrl_sock >= 0) {
+		close(dev->ctrl_sock);
+		dev->ctrl_sock = -1;
+	}
+
 	if (dev->tgt.ops->deinit_tgt)
 		dev->tgt.ops->deinit_tgt(dev);
 	close(dev->fds[0]);
@@ -968,6 +1101,7 @@ static int cmd_dev_add(int argc, char *argv[])
 		{ "queues",		1,	NULL, 'q' },
 		{ "depth",		1,	NULL, 'd' },
 		{ "recovery",		0,	NULL, 'r' },
+		{ "control_port",	1,	NULL, 0},
 		{ "debug_mask",	1,	NULL, 0},
 		{ "quiet",	0,	NULL, 0},
 		{ NULL }
@@ -978,6 +1112,7 @@ static int cmd_dev_add(int argc, char *argv[])
 	int ret, option_idx, opt;
 	const char *tgt_type = NULL;
 	int dev_id = -1;
+	int ctrl_port = -1;
 	unsigned nr_queues = 2, depth = UBLK_QUEUE_DEPTH;
 	int user_recovery = 0;
 
@@ -1000,6 +1135,8 @@ static int cmd_dev_add(int argc, char *argv[])
 			user_recovery = 1;
 			break;
 		case 0:
+			if (!strcmp(longopts[option_idx].name, "control_port"))
+				ctrl_port = strtol(optarg, NULL, 10);
 			if (!strcmp(longopts[option_idx].name, "debug_mask"))
 				ublk_dbg_mask = strtol(optarg, NULL, 16);
 			if (!strcmp(longopts[option_idx].name, "quiet"))
@@ -1047,6 +1184,9 @@ static int cmd_dev_add(int argc, char *argv[])
 		goto fail;
 	}
 
+	if (ctrl_port < 0)
+		ctrl_port = UBLK_CTRL_PORT_BASE + dev->dev_info.dev_id;
+	dev->ctrl_port = ctrl_port;
 	ret = ublk_start_daemon(dev, false);
 	if (ret < 0) {
 		ublk_err("%s: can't start daemon id %d, type %s\n",
@@ -1066,6 +1206,7 @@ static int cmd_dev_recover(int argc, char *argv[])
 	static const struct option longopts[] = {
 		{ "type",		1,	NULL, 't' },
 		{ "number",		1,	NULL, 'n' },
+		{ "control_port",	1,	NULL, 0},
 		{ "debug_mask",	1,	NULL, 0},
 		{ "quiet",	0,	NULL, 0},
 		{ NULL }
@@ -1076,6 +1217,7 @@ static int cmd_dev_recover(int argc, char *argv[])
 	int ret, option_idx, opt;
 	const char *tgt_type = NULL;
 	int dev_id = -1;
+	int ctrl_port = -1;
 
 	while ((opt = getopt_long(argc, argv, "-:t:n:d:q:",
 				  longopts, &option_idx)) != -1) {
@@ -1087,6 +1229,8 @@ static int cmd_dev_recover(int argc, char *argv[])
 			tgt_type = optarg;
 			break;
 		case 0:
+			if (!strcmp(longopts[option_idx].name, "control_port"))
+				ctrl_port = strtol(optarg, NULL, 10);
 			if (!strcmp(longopts[option_idx].name, "debug_mask"))
 				ublk_dbg_mask = strtol(optarg, NULL, 16);
 			if (!strcmp(longopts[option_idx].name, "quiet"))
@@ -1126,6 +1270,9 @@ static int cmd_dev_recover(int argc, char *argv[])
 		goto fail;
 	}
 
+	if (ctrl_port < 0)
+		ctrl_port = UBLK_CTRL_PORT_BASE + dev->dev_info.dev_id;
+	dev->ctrl_port = ctrl_port;
 	dev->tgt.ops = ops;
 	dev->tgt.argc = argc;
 	dev->tgt.argv = argv;
@@ -1309,16 +1456,18 @@ static int cmd_dev_list(int argc, char *argv[])
 
 static int cmd_dev_help(int argc, char *argv[])
 {
-	printf("%s add -t {null|loop} [-q nr_queues] [-d depth] [-n dev_id] \n",
+	printf("%s add -t {null|loop} [-q nr_queues] [-d depth] [-n dev_id] [--control_port port] \n",
 			argv[0]);
 	printf("\t default: nr_queues=2(max 4), depth=128(max 128), dev_id=-1(auto allocation)\n");
 	printf("\t -t loop -f backing_file \n");
 	printf("\t -t null\n");
+	printf("\t --control_port default %d+dev_id, 0 disables the control socket\n",
+			UBLK_CTRL_PORT_BASE);
 	printf("%s del [-n dev_id] -a \n", argv[0]);
 	printf("\t -a delete all devices -n delete specified device\n");
 	printf("%s list [-n dev_id] -a \n", argv[0]);
 	printf("\t -a list all devices, -n list specified device, default -a \n");
-	printf("%s recover -t {null|loop} [-n dev_id] \n", argv[0]);
+	printf("%s recover -t {null|loop} [-n dev_id] [--control_port port] \n", argv[0]);
 	printf("\t -t loop -f backing_file \n");
 	printf("\t -t null\n");
 	return 0;
