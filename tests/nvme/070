@@ -219,7 +219,7 @@ test() {
 
 	set_io_timeout_of_subsystem "${def_subsysnqn}" 2000
 
-	if ! ${UBLK_PROG} inject -n 0 -o write -d 4 -c 1 >> "$FULL" 2>&1; then
+	if ! ${UBLK_PROG} inject -n 0 -o write -d 18 -c 1 >> "$FULL" 2>&1; then
 		echo "FAIL: can not inject write delay"
 	fi
 
