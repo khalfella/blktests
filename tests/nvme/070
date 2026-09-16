@@ -54,6 +54,7 @@ requires() {
 	_have_loop
 	_have_ublk
 	_have_module_param_value nvme_core multipath Y
+	_require_nvme_trtype tcp rdma fc
 	_require_nvme_trtype_is_fabrics
 	_have_src_program nvme-ghost-write
 }
