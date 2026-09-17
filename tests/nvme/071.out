@@ -1,0 +1,67 @@
+Running nvme/070
+Target ports: 2
+starting nvme-ghost-write test program
+iteration number 0, writing data
+validating written data
+successfully validated
+iteration number 1, writing data
+validating written data
+successfully validated
+iteration number 2, writing data
+validating written data
+successfully validated
+iteration number 3, writing data
+validating written data
+successfully validated
+iteration number 4, writing data
+validating written data
+successfully validated
+iteration number 5, writing data
+validating written data
+successfully validated
+iteration number 6, writing data
+validating written data
+successfully validated
+iteration number 7, writing data
+validating written data
+successfully validated
+iteration number 8, writing data
+validating written data
+successfully validated
+iteration number 9, writing data
+validating written data
+successfully validated
+finished nvme-ghost-write test program
+starting nvme-ghost-write test program
+iteration number 0, writing data
+validating written data
+successfully validated
+iteration number 1, writing data
+validating written data
+successfully validated
+iteration number 2, writing data
+validating written data
+successfully validated
+iteration number 3, writing data
+validating written data
+successfully validated
+iteration number 4, writing data
+validating written data
+successfully validated
+iteration number 5, writing data
+validating written data
+successfully validated
+iteration number 6, writing data
+validating written data
+successfully validated
+iteration number 7, writing data
+validating written data
+successfully validated
+iteration number 8, writing data
+validating written data
+successfully validated
+iteration number 9, writing data
+validating written data
+successfully validated
+finished nvme-ghost-write test program
+Test complete
