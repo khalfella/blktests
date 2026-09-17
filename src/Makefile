@@ -24,6 +24,7 @@ C_TARGETS := \
 	mount_clear_sock \
 	nvme-delay-ioctl \
 	nvme-passthrough-meta \
+	nvme-ghost-write-detector \
 	ioctl-lbmd-query \
 	nbdsetsize \
 	openclose \
